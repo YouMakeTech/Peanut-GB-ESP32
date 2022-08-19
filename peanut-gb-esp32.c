@@ -77,12 +77,13 @@
 // Global variables
 static struct gb_s gb;      // Emulator context. Only values within the `direct` struct may be modified directly by the front-end implementation.
 static uint8_t ram[32768];  // Cartridge RAM
-SPIClass *spi = NULL;       // Object for the SPI communication bus
-unsigned long start_time;   // start time used to compute Frames Per Second (FPS)
-unsigned long end_time;     // end time used to compute Frames Per Second (FPS)
-unsigned long frames;       // number of frames rendered since start_time (to compute FPS)
-const unsigned long target_period_us = 1000000 / VERTICAL_SYNC;
-uint32_t delta;
+static SPIClass *spi = NULL;       // Object for the SPI communication bus
+static unsigned long start_time;   // start time used to compute Frames Per Second (FPS)
+static unsigned long end_time;     // end time used to compute Frames Per Second (FPS)
+static unsigned long frames;       // number of frames rendered since start_time (to compute FPS)
+static const float target_period_us = 1000000 / VERTICAL_SYNC; // Target period for screen refresh of 59.7275 Hz
+static float delta;                // delay that will draw the screen at a rate of 59.7275 Hz
+static uint16_t fb[SCREEN_SIZE_Y]; // buffer to store pixels for the current line
 
 struct gb_priv
 {
@@ -184,7 +185,6 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
 		{ 0xFFFF, 0xFC10, 0x89C7, 0x0000 },
 		{ 0xFFFF, 0x651F, 0x001F, 0x0000 }
 	};
-	static uint16_t fb[LCD_WIDTH];
 
 	for(unsigned int x = 0; x < LCD_WIDTH; x++)
 	{
@@ -291,9 +291,16 @@ void setup()
     
     gb_init_lcd(&gb, &lcd_draw_line);
     mk_ili9225_init();
+
     // Clear LCD screen
-    mk_ili9225_write_pixels_start(); 
-    // TODO
+    for(uint8_t y=0;y<SCREEN_SIZE_Y;y++) {
+        fb[y]=0x0000; // background color RGB565 (e.g. black = 0x0000, red=0xf800)
+    }
+    mk_ili9225_set_window(0,SCREEN_SIZE_X-1,0,SCREEN_SIZE_Y-1);
+    for(uint8_t x=0;x<SCREEN_SIZE_X;x++) {
+        mk_ili9225_set_address(x,0);
+        mk_ili9225_write_pixels(fb, SCREEN_SIZE_Y);
+    }
     
     // Set LCD window to DMG size.
     mk_ili9225_set_window(16, LCD_HEIGHT + 15, 31, LCD_WIDTH + 30);
@@ -313,8 +320,6 @@ void setup()
     start_time=micros();
     delta=0;
     frames=0;
-
-    Serial.printf("target_period_us=%d\n",target_period_us);
 }
 
 void loop()
@@ -325,24 +330,20 @@ void loop()
     frames++;
 
     // Use a delay that will draw the screen at a rate of 59.7275 Hz */
-    delayMicroseconds(delta);
+    delayMicroseconds((uint32_t)delta);
 
-    // Display Frames Per Second
     if(frames>60)
     {
+        // Compute the delay delta that will draw the screen at a rate of 59.7275 Hz */
         end_time=micros();
-
-        // Compute the delay that will draw the screen at a rate of 59.7275 Hz */
-        if ((end_time - start_time)<target_period_us*frames)
-        {
-            delta += (target_period_us*frames - (end_time - start_time))/frames;
-        }
-        else
-        {
-            delta=0;
+        delta += (target_period_us - (float)(end_time - start_time)/frames);
+        if(delta<1) {
+            delta=1;
         }
         
-        Serial.printf("FPS=%d delta=%d\n",(1000*1000*frames)/(end_time-start_time),delta);
+        // Display Frames Per Second
+        Serial.printf("FPS=%d delta=%.0f us\n",(1000*1000*frames)/(end_time-start_time),delta);
+        
         frames=0;
         start_time=end_time;
     }
