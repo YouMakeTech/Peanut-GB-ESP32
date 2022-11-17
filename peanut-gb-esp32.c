@@ -38,14 +38,15 @@
 #include "freertos/task.h"
 
 // Peanut-GB emulator settings
-#define ENABLE_SOUND 0
+#define ENABLE_SOUND 1
 #define ENABLE_LCD 1
 #define PEANUT_GB_HIGH_LCD_ACCURACY 1
 #define PEANUT_GB_USE_BIOS 0
 
 // Project headers
 #include "minigb_apu.h"
-#define AUDIO_BUFFER_SIZE_BYTES (AUDIO_SAMPLES*4) 
+#define AUDIO_BUFFER_SIZE_BYTES (AUDIO_SAMPLES*4)
+#define AUDIO_BUFFER_COUNT 32
 #include "peanut_gb.h"
 #include "rom.h"
 
@@ -73,25 +74,26 @@
 #define GPIO_DIN    33
 
 // Global variables
-static struct gb_s gb;      // Emulator context. Only values within the `direct` struct may be modified directly by the front-end implementation.
-static uint8_t ram[32768];  // Cartridge RAM
+static struct gb_s gb;       // Emulator context. Only values within the `direct` struct may be modified directly by the front-end implementation.
+static uint8_t ram[32768];   // Cartridge RAM
 static int64_t start_time;   // start time used to compute Frames Per Second (FPS)
 static int64_t end_time;     // end time used to compute Frames Per Second (FPS)
 static int64_t frames;       // number of frames rendered since start_time (to compute FPS)
-static const float target_period_us = 1000000 / VERTICAL_SYNC; // Target period for screen refresh of 64 Hz
-static float delta;                // delay that will draw the screen at a rate of 64 Hz
+static int64_t video_frames; // number of video frames rendered since start_time (to compute FPS)
+static QueueHandle_t queue_emulation_task = NULL; // Queue used to communicate with the emulation task
+static QueueHandle_t queue_audio_task = NULL; // Queue used to communicate with the audio task
 
 // stream contains 512 (=AUDIO_SAMPLES) audio samples
 // each sample is 32 bits
 // (16 bits for the left channel + 16 bits for the right channel in stereo interleaved format)
 // This is intended to be played at 32768Hz (=AUDIO_SAMPLE_RATE)
 int16_t *stream;
-size_t i2s_bytes_write = 0;
+size_t i2s_bytes_written = 0;
 
 #if ENABLE_LCD
     // To speed up transfers, every SPI transfer sends a bunch of lines. This define specifies how many. More means more memory use,
     // but less overhead for setting up / finishing transfers. Make sure 144 is dividable by this.
-    #define PARALLEL_LINES (16)
+    #define PARALLEL_LINES (144)
 
     // Maximum transfer size, in bytes
     #define ILI9225_MAX_TRANSFER_SIZE_BYTES (PARALLEL_LINES*LCD_WIDTH*sizeof(uint16_t))
@@ -102,9 +104,8 @@ size_t i2s_bytes_write = 0;
 
     static spi_device_handle_t spi_lcd;
     static spi_transaction_t spi_transaction[ILI9225_TRANSACTION_QUEUE_SIZE];
-    static uint16_t current_transaction;
     static uint16_t *line_data[ILI9225_TRANSACTION_QUEUE_SIZE];  // buffers to store pixels
-    static bool transaction_in_progress=false;
+    static QueueHandle_t queue_video_task = NULL; // Queue used to communicate with the video task
 
     void ILI9225_write16(uint16_t value) {
         uint16_t value_swapped;
@@ -256,12 +257,9 @@ size_t i2s_bytes_write = 0;
         // Wait for the completion of sending the previous line if necessary        
         esp_err_t ret;
         spi_transaction_t *rtrans;
-        if(transaction_in_progress) {
-            for(uint16_t i=0;i<ILI9225_TRANSACTION_QUEUE_SIZE;i++) {
-                ret=spi_device_get_trans_result(spi_lcd,&rtrans,portMAX_DELAY);
-                assert(ret==ESP_OK);
-            }
-            transaction_in_progress=false;
+        for(uint8_t i=0;i<ILI9225_TRANSACTION_QUEUE_SIZE;i++) {
+            ret=spi_device_get_trans_result(spi_lcd,&rtrans,portMAX_DELAY);
+            assert(ret==ESP_OK);
         }
     }
 
@@ -272,14 +270,13 @@ size_t i2s_bytes_write = 0;
         gpio_set_level(GPIO_RS,1);   // data mode
     }
 
-    void ILI9225_write_lines(uint16_t *line_data) {
+    void ILI9225_write_lines(uint8_t current_transaction) {
         esp_err_t ret;
-
+        uint16_t *current_line_data=line_data[current_transaction];
         spi_transaction[current_transaction].length=PARALLEL_LINES*LCD_WIDTH*16; // transaction length in bits.
-        spi_transaction[current_transaction].tx_buffer=line_data;
-        ret=spi_device_queue_trans(spi_lcd,&spi_transaction[current_transaction],portMAX_DELAY);  // Queue the transaction
+        spi_transaction[current_transaction].tx_buffer=current_line_data;
+        ret=spi_device_queue_trans(spi_lcd,&spi_transaction[current_transaction],0);  // Queue the transaction
         assert(ret==ESP_OK);            // Should have had no issues.
-        transaction_in_progress=true;
 
         // When we are here, the SPI driver is busy (in the background) getting the transaction sent. That happens
         // mostly using DMA, so the CPU doesn't have much to do here. We're not going to wait for the transaction to
@@ -357,6 +354,7 @@ size_t i2s_bytes_write = 0;
         };
 
         uint16_t y=line%PARALLEL_LINES;
+        uint8_t current_transaction=line/PARALLEL_LINES;
         bool ready_to_send=((line+1)%PARALLEL_LINES)==0;
         uint16_t *current_line_data=line_data[current_transaction];
 
@@ -367,14 +365,10 @@ size_t i2s_bytes_write = 0;
         }
         
         if(ready_to_send) {
-            // The line_data buffer is full => copy it to line_data_ 
-            // and send line_data_ to the LCD screen in the backgroung
+            // The current_line_data buffer is full => send
+            // it to the LCD screen in the background
             // while we continue to compute the next lines
-            ILI9225_write_lines(current_line_data);
-            current_transaction++;
-            if(current_transaction>=ILI9225_TRANSACTION_QUEUE_SIZE) {
-                current_transaction=0;
-            }
+            xQueueSend(queue_video_task,&current_transaction,0);
         }
     }
 #endif
@@ -459,9 +453,81 @@ static void IRAM_ATTR gpio_isr_handler(void* arg)
     }
 }
 
+static void timer_task(void *arg) {
+    uint8_t data=0;
+    xQueueSend(queue_emulation_task,&data,0);
+    xQueueSend(queue_audio_task,&data,0);
+}
+
+
+ // Execute CPU cycles for one frame
+ // emulation_task is called at 59.7275 Hz
+static void emulation_task(void *arg) {
+    uint8_t data;
+    for(;;) {
+        // Wait until something arrives in the queue
+        xQueueReceive(queue_emulation_task,&data,portMAX_DELAY);
+        // printf("xQueueReceive received %d\n",data);
+
+        gb_run_frame(&gb);
+        frames++;
+    }
+}
+
+#if ENABLE_SOUND
+// Play the audio
+static void audio_task(void *arg) {
+    uint8_t data;
+    for(;;) {
+        // Wait until something arrives in the queue
+        xQueueReceive(queue_audio_task,&data,portMAX_DELAY);
+
+        audio_callback(NULL, stream, AUDIO_BUFFER_SIZE_BYTES);
+        i2s_write(0, stream, AUDIO_BUFFER_SIZE_BYTES, &i2s_bytes_written, 0);
+        //printf("i2s_bytes_written = %d\n", i2s_bytes_written);
+        if(i2s_bytes_written<AUDIO_BUFFER_SIZE_BYTES) {
+            printf("audio_task: i2s_bytes_written = %d\n", i2s_bytes_written);
+        }
+    }    
+}
+#endif
+
+#if ENABLE_LCD
+// Refresh the LCD screen
+static void video_task(void *arg) {
+    uint8_t current_transaction;
+    
+    for(;;) {
+        // Wait until something arrives in the queue
+        xQueueReceive(queue_video_task,&current_transaction,portMAX_DELAY);
+        // printf("xQueueReceive received %d\n",current_transaction);
+
+        if(current_transaction==0) {
+            // Go back to the top left corner of the Game Boy screen
+            ILI9225_set_adress(159,31); 
+
+            // Prepare to write lines
+            ILI9225_write_pixels_start();
+        }
+
+        ILI9225_write_lines(current_transaction);
+
+        if(current_transaction==(ILI9225_TRANSACTION_QUEUE_SIZE-1)) {
+            // last line received
+            // Before we continue, make sure all SPI transfers 
+            // which were running in the background are now complete
+            ILI9225_wait_for_transaction_completion();
+            ILI9225_write_pixels_end();
+            video_frames++;
+        }
+    }
+}    
+#endif
+
 void app_main()
 {
     enum gb_init_error_e gb_ret;
+    printf("app_main running on core %d\n",xPortGetCoreID());
     printf("INIT: \n");
 
     // Initialise GameBoy emulator
@@ -552,7 +618,7 @@ void app_main()
 
     // Speed improvements options
     gb.direct.interlace=false;
-    gb.direct.frame_skip=2;
+    gb.direct.frame_skip=4;
 #endif
 
     // Allocate memory for the stream buffer
@@ -567,8 +633,8 @@ void app_main()
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_MSB,
-        .dma_buf_count = 2,             // The total number of DMA buffers to receive/transmit data
-        .dma_buf_len = AUDIO_SAMPLES/2,   // Number of frames in a DMA buffer
+        .dma_buf_count = AUDIO_BUFFER_COUNT,             // The total number of DMA buffers to receive/transmit data
+        .dma_buf_len = AUDIO_SAMPLES,   // Number of frames in a DMA buffer
         .use_apll = true,       // I2S using APLL as main I2S clock, enable it to get accurate clock */
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1
     };
@@ -584,62 +650,82 @@ void app_main()
     i2s_set_pin(0, &pin_config);
 
     // Initialize audio emulation
-    i2s_write(0, stream, AUDIO_BUFFER_SIZE_BYTES, &i2s_bytes_write, portMAX_DELAY);
+    // for(uint16_t i=0;i<AUDIO_BUFFER_COUNT;i++) {
+    //     i2s_write(0, stream, AUDIO_BUFFER_SIZE_BYTES, &i2s_bytes_written, portMAX_DELAY);
+    // }
     audio_init();
 
-    printf("AUDIO: \n");
+    // Create the queue to communicate with the video task
+	queue_emulation_task=xQueueCreate(1,sizeof(uint8_t));
+    assert(queue_emulation_task!=NULL);
+
+    queue_audio_task=xQueueCreate(1,sizeof(uint8_t));
+    assert(queue_audio_task!=NULL);
+
+    
+    // Create the queue to communicate with the video task
+	queue_video_task=xQueueCreate(ILI9225_TRANSACTION_QUEUE_SIZE,sizeof(uint8_t));
+    assert(queue_video_task!=NULL);
 
     // Initialize variables for Frames Per Second computation
     start_time=esp_timer_get_time();
-    delta=0;
     frames=0;
+    video_frames=0;
 
-    while(true)
-    {
-#if ENABLE_LCD        
-        // Go back to the top left corner of the Game Boy screen
-        ILI9225_set_adress(159,31); 
+    // Create a task to run the emulator
+    xTaskCreatePinnedToCore(&emulation_task,      // The function that implements the task
+                            "emulation_task",     // The text name assigned to the task - for debug only as it is not used by the kernel
+                            1024,               // The size of the stack to allocate to the task
+                            NULL,               // The parameter passed to the task - not used in this case
+                            tskIDLE_PRIORITY+3, // The priority assigned to the task
+                            NULL,               // The task handle is not required, so NULL is passed
+                            0);                 // The core (0 or 1)
 
-        // Prepare to write lines
-        current_transaction=0;
-        ILI9225_write_pixels_start();
-#endif
+    // Create a periodic timer to run the emulation task at 59.7275 Hz
+    const esp_timer_create_args_t timer_task_timer_args = {
+            .callback = &timer_task,
+            .name = "timer_task",
+            .skip_unhandled_events = true
+    };
+    esp_timer_handle_t timer_task_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_task_timer_args, &timer_task_timer));
+    uint64_t VERTICAL_SYNC_PERIOD_US=(1000000.0/VERTICAL_SYNC);
+    printf("VERTICAL_SYNC_PERIOD=%lld µs\n",VERTICAL_SYNC_PERIOD_US);
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_task_timer, VERTICAL_SYNC_PERIOD_US));
 
-        // Execute CPU cycles for one frame
-        // Ideally, gb_run_frame is called at 59.7275 Hz
-        gb_run_frame(&gb);
-        frames++;
+
 
 #if ENABLE_SOUND
-        audio_callback(NULL, stream, AUDIO_BUFFER_SIZE_BYTES);
-        i2s_write(0, stream, AUDIO_BUFFER_SIZE_BYTES, &i2s_bytes_write, portMAX_DELAY);
-        // printf("i2s_bytes_write = %d\n", i2s_bytes_write);
+    // Create a task to play the audio
+    xTaskCreatePinnedToCore(&audio_task,      // The function that implements the task
+                            "audio_task",     // The text name assigned to the task - for debug only as it is not used by the kernel
+                            1024,               // The size of the stack to allocate to the task
+                            NULL,               // The parameter passed to the task - not used in this case
+                            tskIDLE_PRIORITY+3, // The priority assigned to the task
+                            NULL,               // The task handle is not required, so NULL is passed
+                            1);                 // The core (0 or 1)
+    printf("AUDIO: \n");
 #endif
 
-#if ENABLE_LCD   
-        // Before we continue, make sure all SPI transfers 
-        // which were running in the background are now complete
-        ILI9225_wait_for_transaction_completion();
-        ILI9225_write_pixels_end();
+#if ENABLE_LCD
+    xTaskCreatePinnedToCore(&video_task,      // The function that implements the task
+                            "video_task",     // The text name assigned to the task - for debug only as it is not used by the kernel
+                            1024,               // The size of the stack to allocate to the task
+                            NULL,               // The parameter passed to the task - not used in this case
+                            tskIDLE_PRIORITY+2, // The priority assigned to the task
+                            NULL,               // The task handle is not required, so NULL is passed
+                            0);                 // The core (0 or 1)
 #endif
 
-        // Use a delay that will draw the screen at a rate of 59.7275 Hz */
-        vTaskDelay(delta / portTICK_PERIOD_MS);
-
-        if(frames>60)
-        {
-            // Compute the delay delta that will draw the screen at a rate of 59.7275 Hz */
-            end_time=esp_timer_get_time();
-            delta += ((target_period_us - (float)(end_time - start_time)/frames)/1000);
-            if(delta<1) {
-                 delta=1;
-            }
+    for(;;) {
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
         
-            // Display Frames Per Second
-            printf("FPS=%lld delta=%.0f ms\n",(1000000*frames)/(end_time-start_time),delta);
+        // Display Frames Per Second
+        end_time=esp_timer_get_time();
+        printf("frames=%lld video_frames=%lld\n",frames,video_frames);
+        frames=0;
+        video_frames=0;
+        start_time=end_time;
         
-            frames=0;
-            start_time=end_time;
-        }
     }
 }
