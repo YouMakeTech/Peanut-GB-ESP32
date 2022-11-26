@@ -46,7 +46,7 @@
 // Project headers
 #include "minigb_apu.h"
 #define AUDIO_BUFFER_SIZE_BYTES (AUDIO_SAMPLES*4)
-#define AUDIO_BUFFER_COUNT 2
+#define AUDIO_BUFFER_COUNT 6    // Number of DMA buffers: make sure AUDIO_SAMPLES is divisible by this
 #include "peanut_gb.h"
 #include "rom.h"
 
@@ -84,10 +84,6 @@ static QueueHandle_t queue_emulation_task = NULL; // Queue used to communicate w
 
 #if ENABLE_SOUND
     // Global variables for audio task
-
-    // Queue used to communicate with the audio task
-    static QueueHandle_t queue_audio_task = NULL; 
-
     // stream contains N=AUDIO_SAMPLES samples
     // each sample is 32 bits
     // (16 bits for the left channel + 16 bits for the right channel in stereo interleaved format)
@@ -483,11 +479,6 @@ static void emulation_task(void *arg) {
         xQueueReceive(queue_emulation_task,&data,portMAX_DELAY);
         // printf("xQueueReceive received %d\n",data);
 
-#if ENABLE_SOUND
-        audio_callback(NULL, stream, AUDIO_BUFFER_SIZE_BYTES);
-        xQueueSend(queue_audio_task,&data,0);
-#endif
-
         gb_run_frame(&gb);
         frames++;
     }
@@ -496,16 +487,12 @@ static void emulation_task(void *arg) {
 #if ENABLE_SOUND
 // Play the audio
 static void audio_task(void *arg) {
-    uint8_t data;
+    printf("AUDIO_SAMPLES=%d\n",AUDIO_SAMPLES);
 
     // Allocate memory for the stream buffer
     stream=heap_caps_malloc(AUDIO_BUFFER_SIZE_BYTES, MALLOC_CAP_DMA);
     assert(stream!=NULL);
     memset(stream,0,AUDIO_BUFFER_SIZE_BYTES);  // Zero out the stream buffer
-
-    // Create the queue to communicate with the audio task
-    queue_audio_task=xQueueCreate(1,sizeof(uint8_t));
-    assert(queue_audio_task!=NULL);
 
     // Initialize I2S sound driver
     i2s_config_t i2s_config = {
@@ -515,7 +502,7 @@ static void audio_task(void *arg) {
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_MSB,
         .dma_buf_count = AUDIO_BUFFER_COUNT,             // The total number of DMA buffers to receive/transmit data
-        .dma_buf_len = AUDIO_SAMPLES,   // Number of frames in a DMA buffer
+        .dma_buf_len = (AUDIO_SAMPLES/AUDIO_BUFFER_COUNT),   // Number of frames in a DMA buffer
         .use_apll = true,       // I2S using APLL as main I2S clock, enable it to get accurate clock */
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1
     };
@@ -534,14 +521,9 @@ static void audio_task(void *arg) {
     audio_init();
 
     for(;;) {
-        // Wait until something arrives in the queue
-        xQueueReceive(queue_audio_task,&data,portMAX_DELAY);
-        
+        audio_callback(NULL, stream, AUDIO_BUFFER_SIZE_BYTES);
         i2s_write(0, stream, AUDIO_BUFFER_SIZE_BYTES, &i2s_bytes_written, portMAX_DELAY);
         //printf("i2s_bytes_written = %d\n", i2s_bytes_written);
-        if(i2s_bytes_written<AUDIO_BUFFER_SIZE_BYTES) {
-            printf("audio_task: i2s_bytes_written = %d\n", i2s_bytes_written);
-        }
     }    
 }
 #endif
